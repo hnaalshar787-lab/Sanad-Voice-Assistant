@@ -1,0 +1,1056 @@
+"""
+سَنَد — نظام الدفع الذكي الصوتي v8.0 (النسخة الموحّدة الاحترافية)
+التطوير: هانم عماد
+────────────────────────────────────────────────────────────────
+النسخة الموحّدة:
+  • تصميم احترافي فاخر (حلقات ذهبية، موجة صوتية، مؤشر خطوات)
+  • صوت عربي حقيقي عبر gTTS — يقرأ كل خيار وكل رسالة بالكامل
+  • بصمة صوتية عالية الدقة (MFCC موسّع + Delta + Chroma)
+  • تشفير كامل للبيانات (cryptography / bcrypt / keyring)
+  • تسجيل بكلمة المرور الصوتية فقط (بدون رقم الجوال)
+  • التحقق المزدوج: كلمة المرور + البصمة الصوتية
+  • مُصمَّم لكبار السن والأميين — لا يحتاج قراءة أو كتابة
+────────────────────────────────────────────────────────────────
+"""
+
+import customtkinter as ctk
+import threading
+import math
+import os
+import sys
+import json
+import time
+import hashlib
+import secrets
+import tempfile
+import numpy as np
+import sounddevice as sd
+import librosa
+from datetime import datetime
+from pathlib import Path
+
+# ─────────────────────────────────────────────
+# مكتبات التشفير والأمان
+# ─────────────────────────────────────────────
+try:
+    from cryptography.fernet import Fernet
+    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+    from cryptography.hazmat.primitives import hashes
+    import base64
+    CRYPTO_OK = True
+except ImportError:
+    CRYPTO_OK = False
+
+try:
+    import bcrypt
+    BCRYPT_OK = True
+except ImportError:
+    BCRYPT_OK = False
+
+try:
+    import keyring
+    KEYRING_OK = True
+except ImportError:
+    KEYRING_OK = False
+
+try:
+    import speech_recognition as sr
+    SR_OK = True
+except ImportError:
+    SR_OK = False
+
+# ─────────────────────────────────────────────
+# مكتبة الصوت العربي (gTTS)
+# ─────────────────────────────────────────────
+try:
+    from gtts import gTTS
+    GTTS_OK = True
+except ImportError:
+    GTTS_OK = False
+
+# ─────────────────────────────────────────────
+# إعدادات المجلدات والبيانات
+# ─────────────────────────────────────────────
+def get_sanad_dir() -> Path:
+    if os.name == "nt":
+        base = Path(os.environ.get("APPDATA", Path.home()))
+    else:
+        base = Path.home() / ".local" / "share"
+    d = base / "Sanad"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+SANAD_DIR   = get_sanad_dir()
+USERS_FILE  = SANAD_DIR / "users.json"
+APP_SERVICE = "SanadPayApp"
+
+# ─────────────────────────────────────────────
+# نظام الصوت العربي الموحّد
+# ─────────────────────────────────────────────
+_speak_lock  = threading.Lock()
+
+def speak(text: str, wait: bool = False):
+    """ينطق النص بالعربية — يدعم الانتظار (wait=True) للتسلسل الصوتي"""
+    def _run():
+        with _speak_lock:
+            _speak_gtts(text)
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    if wait:
+        t.join()
+
+
+def _speak_gtts(text: str):
+    """تشغيل الصوت عبر gTTS — يضمن اكتمال الجملة"""
+    if not GTTS_OK:
+        _speak_fallback(text)
+        return
+    try:
+        tmp = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
+        tmp.close()
+        tts = gTTS(text=text, lang='ar', slow=False)
+        tts.save(tmp.name)
+
+        if os.name == "nt":
+            import ctypes
+            alias = "sanad_snd"
+            ctypes.windll.winmm.mciSendStringW(
+                f'open "{tmp.name}" type mpegvideo alias {alias}', None, 0, None)
+            ctypes.windll.winmm.mciSendStringW(
+                f'play {alias} wait', None, 0, None)
+            ctypes.windll.winmm.mciSendStringW(
+                f'close {alias}', None, 0, None)
+        else:
+            if os.system(f'which mpg123 > /dev/null 2>&1') == 0:
+                os.system(f'mpg123 -q "{tmp.name}"')
+            elif os.system(f'which afplay > /dev/null 2>&1') == 0:
+                os.system(f'afplay "{tmp.name}"')
+            else:
+                try:
+                    import pygame
+                    pygame.mixer.init()
+                    pygame.mixer.music.load(tmp.name)
+                    pygame.mixer.music.play()
+                    while pygame.mixer.music.get_busy():
+                        time.sleep(0.05)
+                except Exception:
+                    pass
+    except Exception as e:
+        print(f"[gTTS Error] {e}")
+        _speak_fallback(text)
+    finally:
+        try:
+            os.unlink(tmp.name)
+        except Exception:
+            pass
+
+
+def _speak_fallback(text: str):
+    """احتياط: pyttsx3 عند عدم توفر gTTS أو الإنترنت"""
+    try:
+        import pyttsx3
+        eng = pyttsx3.init()
+        eng.setProperty('rate', 130)
+        eng.setProperty('volume', 1.0)
+        for v in eng.getProperty('voices'):
+            if 'arab' in v.id.lower() or 'ar' in v.id.lower():
+                eng.setProperty('voice', v.id)
+                break
+        eng.say(text)
+        eng.runAndWait()
+    except Exception as e:
+        print(f"[Fallback TTS Error] {e}")
+
+
+# ─────────────────────────────────────────────
+# معالجة الصوت واستخراج البصمة
+# ─────────────────────────────────────────────
+
+def preprocess_audio(recording: np.ndarray, fs: int = 16000) -> np.ndarray:
+    y = recording.flatten().astype(np.float32)
+    y_trimmed, _ = librosa.effects.trim(y, top_db=20)
+    if np.max(np.abs(y_trimmed)) > 0:
+        y_trimmed = y_trimmed / np.max(np.abs(y_trimmed))
+    y_pre = np.append(y_trimmed[0], y_trimmed[1:] - 0.97 * y_trimmed[:-1])
+    return y_pre
+
+
+def extract_fingerprint(recording: np.ndarray, fs: int = 16000) -> np.ndarray:
+    y = preprocess_audio(recording, fs)
+    mfccs    = librosa.feature.mfcc(y=y, sr=fs, n_mfcc=40)
+    delta1   = librosa.feature.delta(mfccs)
+    delta2   = librosa.feature.delta(mfccs, order=2)
+    chroma   = librosa.feature.chroma_stft(y=y, sr=fs, n_chroma=12)
+    contrast = librosa.feature.spectral_contrast(y=y, sr=fs, n_bands=6)
+    zcr      = librosa.feature.zero_crossing_rate(y)
+    rms      = librosa.feature.rms(y=y)
+    mel      = librosa.feature.melspectrogram(y=y, sr=fs, n_mels=40)
+    mel_db   = librosa.power_to_db(mel, ref=np.max)
+    features = np.concatenate([
+        np.mean(mfccs, axis=1),    np.std(mfccs, axis=1),
+        np.mean(delta1, axis=1),   np.std(delta1, axis=1),
+        np.mean(delta2, axis=1),
+        np.mean(chroma, axis=1),   np.std(chroma, axis=1),
+        np.mean(contrast, axis=1),
+        [np.mean(zcr), np.std(zcr)],
+        [np.mean(rms), np.std(rms)],
+        np.mean(mel_db, axis=1),
+    ])
+    return features
+
+
+def voice_similarity(fp1: np.ndarray, fp2: np.ndarray) -> float:
+    if fp1 is None or fp2 is None:
+        return 0.0
+    min_len = min(len(fp1), len(fp2))
+    fp1, fp2 = fp1[:min_len], fp2[:min_len]
+    n1, n2 = np.linalg.norm(fp1), np.linalg.norm(fp2)
+    if n1 == 0 or n2 == 0:
+        return 0.0
+    cosine = float(np.dot(fp1, fp2) / (n1 * n2))
+    dist = np.linalg.norm(fp1 - fp2)
+    max_dist = n1 + n2
+    euclidean_sim = 1.0 - (dist / max_dist) if max_dist > 0 else 0.0
+    return 0.6 * cosine + 0.4 * euclidean_sim
+
+
+def aggregate_fingerprints(fps: list) -> np.ndarray:
+    if not fps:
+        return None
+    if len(fps) == 1:
+        return fps[0]
+    min_len = min(len(f) for f in fps)
+    fps_t = [f[:min_len] for f in fps]
+    n = len(fps_t)
+    weights = np.ones(n)
+    for i in range(n):
+        for j in range(n):
+            if i != j:
+                weights[i] += voice_similarity(fps_t[i], fps_t[j])
+    weights /= weights.sum()
+    result = np.zeros(min_len)
+    for fp, w in zip(fps_t, weights):
+        result += w * fp
+    return result
+
+
+def transcribe_audio(recording: np.ndarray, fs: int = 16000) -> str:
+    if not SR_OK:
+        fp = extract_fingerprint(recording, fs)
+        return "voice_" + hashlib.md5(fp.tobytes()).hexdigest()[:8]
+    try:
+        import io, wave as wavemod
+        recognizer = sr.Recognizer()
+        recognizer.energy_threshold = 300
+        recognizer.dynamic_energy_threshold = True
+        recognizer.pause_threshold = 0.8
+        y = (recording.flatten() * 32767).astype(np.int16)
+        buf = io.BytesIO()
+        with wavemod.open(buf, 'wb') as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(fs)
+            wf.writeframes(y.tobytes())
+        buf.seek(0)
+        with sr.AudioFile(buf) as source:
+            recognizer.adjust_for_ambient_noise(source, duration=0.3)
+            audio = recognizer.record(source)
+        try:
+            return recognizer.recognize_google(audio, language="ar-SA").strip().lower()
+        except Exception:
+            try:
+                return recognizer.recognize_google(audio, language="en-US").strip().lower()
+            except Exception:
+                return ""
+    except Exception:
+        return ""
+
+
+# ─────────────────────────────────────────────
+# طبقة الأمان (SecurityLayer)
+# ─────────────────────────────────────────────
+class SecurityLayer:
+    LOGIN_THRESHOLD   = 0.78
+    PAYMENT_THRESHOLD = 0.75
+
+    @staticmethod
+    def hash_spoken_word(word: str) -> str:
+        if BCRYPT_OK:
+            return bcrypt.hashpw(word.encode(), bcrypt.gensalt()).decode()
+        salt = secrets.token_hex(16)
+        return f"sha256:{salt}:{hashlib.sha256((word+salt).encode()).hexdigest()}"
+
+    @staticmethod
+    def verify_spoken_word(word: str, hashed: str) -> bool:
+        if not hashed: return False
+        if BCRYPT_OK and not hashed.startswith("sha256:"):
+            try: return bcrypt.checkpw(word.encode(), hashed.encode())
+            except: return False
+        parts = hashed.split(":")
+        if len(parts) < 3: return False
+        return hashlib.sha256((word+parts[1]).encode()).hexdigest() == parts[2]
+
+    @staticmethod
+    def store_word_hash(user_id: str, hashed: str):
+        if KEYRING_OK:
+            keyring.set_password(APP_SERVICE, f"{user_id}_word", hashed)
+        else:
+            meta = SecurityLayer._load_meta()
+            meta.setdefault("words", {})[user_id] = hashed
+            SecurityLayer._save_meta(meta)
+
+    @staticmethod
+    def get_word_hash(user_id: str):
+        if KEYRING_OK:
+            return keyring.get_password(APP_SERVICE, f"{user_id}_word")
+        return SecurityLayer._load_meta().get("words", {}).get(user_id)
+
+    @staticmethod
+    def save_fingerprint(fp: np.ndarray, user_id: str, key_material: str):
+        fp_path = SANAD_DIR / f"{user_id}_voice.enc"
+        salt = secrets.token_bytes(16)
+        key = SecurityLayer._derive_key(key_material, salt)
+        if CRYPTO_OK:
+            ct = Fernet(key).encrypt(fp.astype(np.float64).tobytes())
+            with open(fp_path, "wb") as f: f.write(salt + ct)
+        else:
+            np.save(SANAD_DIR / f"{user_id}_voice.npy", fp)
+
+    @staticmethod
+    def load_fingerprint(user_id: str, key_material: str):
+        fp_path = SANAD_DIR / f"{user_id}_voice.enc"
+        if not fp_path.exists():
+            npy = SANAD_DIR / f"{user_id}_voice.npy"
+            return np.load(npy) if npy.exists() else None
+        with open(fp_path, "rb") as f: data = f.read()
+        key = SecurityLayer._derive_key(key_material, data[:16])
+        try:
+            return np.frombuffer(Fernet(key).decrypt(data[16:]), dtype=np.float64)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _derive_key(password: str, salt: bytes) -> bytes:
+        kdf = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=salt, iterations=100_000)
+        return base64.urlsafe_b64encode(kdf.derive(password.encode()))
+
+    @staticmethod
+    def _load_meta():
+        if USERS_FILE.exists():
+            with open(USERS_FILE, encoding="utf-8") as f: return json.load(f)
+        return {}
+
+    @staticmethod
+    def _save_meta(data):
+        with open(USERS_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+
+    @staticmethod
+    def save_user_meta(user_id, info):
+        meta = SecurityLayer._load_meta()
+        meta.setdefault("users", {})[user_id] = info
+        SecurityLayer._save_meta(meta)
+
+    @staticmethod
+    def get_user_meta(user_id):
+        return SecurityLayer._load_meta().get("users", {}).get(user_id, {})
+
+    @staticmethod
+    def list_users():
+        return list(SecurityLayer._load_meta().get("users", {}).keys())
+
+
+# ─────────────────────────────────────────────
+# الألوان والتنسيق
+# ─────────────────────────────────────────────
+C = {
+    "bg":          "#0D0A04",
+    "surface":     "#161006",
+    "card":        "#1E1609",
+    "card_border": "#3A2A0F",
+    "gold":        "#D4A843",
+    "gold_lt":     "#F0CC7A",
+    "gold_dark":   "#8B6A1F",
+    "gold_glow":   "#1A1408",
+    "white":       "#F5EDD5",
+    "white_70":    "#B8A882",
+    "white_40":    "#6B5F45",
+    "success":     "#2E7D52",
+    "danger":      "#B03030",
+    "info":        "#1A5F8A",
+    "warning":     "#C07820",
+    "btn_text":    "#0D0A04",
+    "step_done":   "#2E7D52",
+    "step_act":    "#D4A843",
+    "step_wait":   "#2A2010",
+}
+
+ctk.set_appearance_mode("dark")
+
+
+# ─────────────────────────────────────────────
+# مكوّنات الواجهة الرسومية
+# ─────────────────────────────────────────────
+
+class GoldenRingsCanvas(ctk.CTkCanvas):
+    """حلقات ذهبية متحركة — شعار سَنَد"""
+    def __init__(self, master, size=180, **kwargs):
+        super().__init__(master, width=size, height=size,
+                         bg=C["bg"], highlightthickness=0, **kwargs)
+        self.size  = size
+        self.phase = 0.0
+        self.pulse = 0.0
+        self._animate()
+
+    def _animate(self):
+        self.delete("all")
+        cx = self.size / 2
+        self.phase += 0.04
+        self.pulse  = 0.5 + 0.5 * math.sin(self.phase * 2)
+
+        for r, rc in zip([28, 44, 60], [C["gold"], C["gold_dark"], C["white_40"]]):
+            self.create_oval(cx-r, cx-r, cx+r, cx+r, outline=rc, width=1)
+
+        r_p = 68 + 6 * self.pulse
+        self.create_oval(cx-r_p, cx-r_p, cx+r_p, cx+r_p,
+                         outline=C["gold"], width=2 + self.pulse)
+
+        for i, (rx, ry) in enumerate([(10,7),(8,10),(6,13),(4,10),(2,7)]):
+            off = i * 3
+            self.create_arc(cx-rx+off, cx-ry, cx+rx+off, cx+ry,
+                            start=200, extent=140,
+                            outline=C["gold_lt"], width=1, style="arc")
+
+        r_d = 3 + 2 * self.pulse
+        self.create_oval(cx-r_d, cx-r_d, cx+r_d, cx+r_d,
+                         fill=C["gold"], outline="")
+        self.after(40, self._animate)
+
+
+class VoiceWaveCanvas(ctk.CTkCanvas):
+    """موجة صوتية متحركة تُظهر نشاط الميكروفون"""
+    def __init__(self, master, height=70, **kwargs):
+        super().__init__(master, height=height, bg=C["card"],
+                         highlightthickness=0, **kwargs)
+        self.active    = False
+        self.phase     = 0.0
+        self.amplitude = 0.0
+        self._animate()
+
+    def _animate(self):
+        self.delete("wave")
+        w = self.winfo_width() or 300
+        h = self.winfo_height() or 70
+
+        if self.active:
+            self.amplitude = min(self.amplitude + 0.15, 1.0)
+        else:
+            self.amplitude = max(self.amplitude - 0.05, 0.0)
+
+        amp = self.amplitude * (h * 0.35)
+        if amp > 0.5:
+            pts = []
+            for x in range(0, w + 5, 3):
+                y = h/2 + amp * math.sin(x * 0.06 + self.phase)
+                pts.extend([x, y])
+            if len(pts) > 4:
+                self.create_line(*pts, fill=C["gold"], width=2.5,
+                                 smooth=True, tags="wave")
+            pts2 = []
+            for x in range(0, w + 5, 3):
+                y = h/2 + (amp*0.4) * math.sin(x * 0.1 + self.phase * 1.3 + 1)
+                pts2.extend([x, y])
+            if len(pts2) > 4:
+                self.create_line(*pts2, fill=C["gold_dark"], width=1.5,
+                                 smooth=True, tags="wave")
+        else:
+            self.create_line(0, h/2, w, h/2, fill=C["white_40"], width=1, tags="wave")
+
+        self.phase += 0.18
+        self.after(30, self._animate)
+
+    def start(self): self.active = True
+    def stop(self):  self.active = False
+
+
+class StepsIndicator(ctk.CTkFrame):
+    """مؤشر الخطوات — خطوتان فقط: الكلمة السرية والحفظ"""
+    LABELS = ["الكلمة السرية", "الحفظ"]
+
+    def __init__(self, master, **kwargs):
+        super().__init__(master, fg_color="transparent", **kwargs)
+        self.dots, self.labels = [], []
+        for lbl in self.LABELS:
+            col = ctk.CTkFrame(self, fg_color="transparent")
+            col.pack(side="left", padx=14)
+            d = ctk.CTkFrame(col, width=24, height=24,
+                             corner_radius=12, fg_color=C["step_wait"])
+            d.pack()
+            l = ctk.CTkLabel(col, text=lbl, font=("Helvetica", 10),
+                             text_color=C["white_40"])
+            l.pack(pady=(4, 0))
+            self.dots.append(d)
+            self.labels.append(l)
+
+    def set_step(self, step: int):
+        for i, (d, l) in enumerate(zip(self.dots, self.labels)):
+            if i < step:
+                d.configure(fg_color=C["step_done"])
+                l.configure(text_color=C["success"])
+            elif i == step:
+                d.configure(fg_color=C["step_act"])
+                l.configure(text_color=C["gold"])
+            else:
+                d.configure(fg_color=C["step_wait"])
+                l.configure(text_color=C["white_40"])
+
+
+class SeparatorLine(ctk.CTkFrame):
+    def __init__(self, master, **kwargs):
+        super().__init__(master, height=1, fg_color=C["gold_dark"], **kwargs)
+
+
+class GoldButton(ctk.CTkButton):
+    def __init__(self, master, **kwargs):
+        defaults = dict(height=62, corner_radius=14,
+                        fg_color=C["gold"], hover_color=C["gold_lt"],
+                        text_color=C["btn_text"], font=("Helvetica", 17, "bold"))
+        defaults.update(kwargs)
+        super().__init__(master, **defaults)
+
+
+class OutlineButton(ctk.CTkButton):
+    def __init__(self, master, **kwargs):
+        defaults = dict(height=55, corner_radius=14,
+                        fg_color="transparent",
+                        border_color=C["gold_dark"], border_width=1,
+                        text_color=C["gold"], hover_color=C["gold_glow"],
+                        font=("Helvetica", 16))
+        defaults.update(kwargs)
+        super().__init__(master, **defaults)
+
+
+class StatusBadge(ctk.CTkFrame):
+    def __init__(self, master, text="", color=None, **kwargs):
+        super().__init__(master, corner_radius=20,
+                         fg_color=color or C["card"],
+                         border_color=C["card_border"], border_width=1, **kwargs)
+        self.lbl = ctk.CTkLabel(self, text=text, font=("Helvetica", 14),
+                                text_color=C["white"])
+        self.lbl.pack(padx=20, pady=10)
+
+    def update(self, text, color=None):
+        self.lbl.configure(text=text)
+        if color:
+            self.configure(fg_color=color)
+
+
+# ─────────────────────────────────────────────
+# شاشة البداية (HomeScreen)
+# ─────────────────────────────────────────────
+class HomeScreen(ctk.CTkFrame):
+    def __init__(self, master, on_login, on_register):
+        super().__init__(master, fg_color=C["bg"])
+        self.pack(fill="both", expand=True)
+        self._build(on_login, on_register)
+        self.after(800, lambda: speak(
+            "أهلاً وسهلاً في نظام سَنَد. "
+            "اضغط على زر تسجيل الدخول إذا كان لديك حساب. "
+            "أو اضغط على زر إنشاء حساب جديد للتسجيل للمرة الأولى."
+        ))
+
+    def _build(self, on_login, on_register):
+        ctk.CTkFrame(self, height=30, fg_color="transparent").pack()
+        GoldenRingsCanvas(self, size=190).pack()
+        ctk.CTkFrame(self, height=8, fg_color="transparent").pack()
+
+        ctk.CTkLabel(self, text="سَنَد",
+                     font=("Georgia", 46, "bold"),
+                     text_color=C["gold"]).pack()
+        ctk.CTkLabel(self, text="نظام الدفع الذكي الصوتي",
+                     font=("Helvetica", 14),
+                     text_color=C["white_70"]).pack(pady=(2, 26))
+
+        SeparatorLine(self).pack(fill="x", padx=40, pady=8)
+
+        GoldButton(self, text="🔊  تسجيل الدخول بصوتك",
+                   command=lambda: [speak("تسجيل الدخول."), on_login()]
+                   ).pack(fill="x", padx=30, pady=(18, 10))
+
+        OutlineButton(self, text="🎤  إنشاء حساب جديد",
+                      command=lambda: [speak("إنشاء حساب جديد."), on_register()]
+                      ).pack(fill="x", padx=30)
+
+        ctk.CTkFrame(self, height=18, fg_color="transparent").pack()
+        ctk.CTkLabel(self, text="مُصمَّم لكبار السن · يعمل بالصوت بالكامل",
+                     font=("Helvetica", 11),
+                     text_color=C["white_40"]).pack()
+
+
+# ─────────────────────────────────────────────
+# شاشة التسجيل (RegisterScreen) — v8
+# التغييرات:
+#   - لا يوجد خطوة رقم الجوال
+#   - 3 محاولات بدل 5
+#   - مؤشر خطوتين فقط: الكلمة السرية + الحفظ
+# ─────────────────────────────────────────────
+class RegisterScreen(ctk.CTkFrame):
+    FS, DUR = 16000, 5
+    NUM_ATTEMPTS = 3  # عدد مرات النطق لتسجيل البصمة
+
+    def __init__(self, master, on_done, on_back):
+        super().__init__(master, fg_color=C["bg"])
+        self.on_done, self.on_back = on_done, on_back
+        self.pack(fill="both", expand=True)
+        self._user_id    = f"user_{int(time.time())}"
+        self._recordings = []
+        self._words      = []
+        self._build()
+        self.after(600, lambda: speak(
+            "شاشة إنشاء حساب جديد. "
+            "ستقوم بنطق كلمتك السرية ثلاث مرات لتسجيل بصمتك الصوتية. "
+            "اختر كلمة سهلة تتذكرها، مثل اسمك أو اسم أحد أبنائك. "
+            "اضغط على زر ابدأ التسجيل للبدء."
+        ))
+
+    def _build(self):
+        header = ctk.CTkFrame(self, fg_color=C["surface"], height=56, corner_radius=0)
+        header.pack(fill="x")
+        ctk.CTkButton(header, text="→", width=44, height=36,
+                      fg_color="transparent", text_color=C["gold"],
+                      font=("Helvetica", 20),
+                      command=lambda: [speak("العودة للقائمة الرئيسية."), self.on_back()]
+                      ).pack(side="left", padx=10)
+        ctk.CTkLabel(header, text="إنشاء حساب جديد",
+                     font=("Helvetica", 17, "bold"),
+                     text_color=C["gold"]).pack(side="right", padx=20)
+
+        SeparatorLine(self).pack(fill="x")
+
+        self.steps = StepsIndicator(self)
+        self.steps.pack(pady=18)
+        self.steps.set_step(0)
+
+        # تعليمات واضحة للمستخدم
+        info_card = ctk.CTkFrame(self, fg_color=C["card"], corner_radius=14,
+                                  border_color=C["card_border"], border_width=1)
+        info_card.pack(fill="x", padx=30, pady=(0, 8))
+        ctk.CTkLabel(info_card,
+                     text="اختر كلمة سرية وانطقها 3 مرات\nمثال: اسمك، أو اسم أحد أبنائك",
+                     font=("Helvetica", 13),
+                     text_color=C["white_70"],
+                     justify="center").pack(padx=16, pady=12)
+
+        self.status = StatusBadge(self, text="سنبدأ بتسجيل كلمتك السرية")
+        self.status.pack(padx=30, fill="x", pady=(0, 8))
+
+        self.wave = VoiceWaveCanvas(self, height=65)
+        self.wave.pack(fill="x", padx=30, pady=8)
+
+        self.attempt_lbl = ctk.CTkLabel(self, text="",
+                                        font=("Helvetica", 13),
+                                        text_color=C["white_40"])
+        self.attempt_lbl.pack(pady=4)
+
+        self.btn = GoldButton(self, text="🎤  ابدأ التسجيل", command=self._start)
+        self.btn.pack(fill="x", padx=30, pady=18)
+
+    def _start(self):
+        self.btn.configure(state="disabled")
+        threading.Thread(target=self._flow, daemon=True).start()
+
+    def _flow(self):
+        # ── الخطوة الوحيدة: الكلمة السرية (3 محاولات) ──
+        self.after(0, lambda: self.steps.set_step(0))
+        speak(
+            "سأطلب منك نطق كلمتك السرية ثلاث مرات "
+            "لأحفظ بصمة صوتك بدقة عالية.",
+            wait=True
+        )
+        time.sleep(0.4)
+
+        for i in range(self.NUM_ATTEMPTS):
+            self.after(0, lambda c=i+1, t=self.NUM_ATTEMPTS: self.attempt_lbl.configure(
+                text=f"المحاولة {c} من {t}", text_color=C["gold"]))
+
+            if i == 0:
+                speak("قل كلمتك السرية الآن.", wait=True)
+            else:
+                speak(f"المحاولة {i+1}. قل كلمتك السرية مرة أخرى.", wait=True)
+
+            time.sleep(0.3)
+            self._set_status(f"🎤 استمع... المحاولة {i+1} من {self.NUM_ATTEMPTS}", C["info"])
+            self.wave.start()
+            rec = sd.rec(int(self.DUR * self.FS), samplerate=self.FS, channels=1)
+            sd.wait()
+            self.wave.stop()
+
+            fp   = extract_fingerprint(rec, self.FS)
+            word = transcribe_audio(rec, self.FS)
+            self._recordings.append(fp)
+            self._words.append(word)
+
+            self._set_status(f"✔ تم تسجيل المحاولة {i+1}", C["success"])
+
+            if i < self.NUM_ATTEMPTS - 1:
+                speak("ممتاز.", wait=True)
+            else:
+                speak("أحسنت! اكتملت جميع المحاولات.", wait=True)
+
+            time.sleep(0.3)
+
+        # ── الحفظ ────────────────────────────────────────
+        self.after(0, lambda: self.steps.set_step(1))
+        self._set_status("💾 جارٍ حفظ بصمتك الصوتية بأمان...", C["warning"])
+        speak("جارٍ حفظ بصمة صوتك وكلمة سرك بأمان.", wait=True)
+
+        # استخراج الكلمة الأكثر تكراراً كمرجع
+        word_final = max(set(self._words), key=self._words.count) if self._words else "unknown"
+        fp_agg = aggregate_fingerprints(self._recordings)
+
+        # حفظ: hash الكلمة + البصمة المشفّرة
+        SecurityLayer.store_word_hash(self._user_id, SecurityLayer.hash_spoken_word(word_final))
+        SecurityLayer.save_fingerprint(fp_agg, self._user_id, word_final)
+        SecurityLayer.save_user_meta(self._user_id, {
+            "created_at": datetime.now().isoformat(),
+            "original_word": word_final,
+            # ملاحظة: لا يوجد رقم جوال في هذه النسخة
+        })
+
+        self._set_status("✅ تم إنشاء حسابك بنجاح!", C["success"])
+        self.after(0, lambda: self.attempt_lbl.configure(
+            text="كلمتك السرية وبصمتك محفوظتان بأمان ✔",
+            text_color=C["success"]))
+        speak(
+            "تم إنشاء حسابك بنجاح. "
+            "كلمتك السرية وبصمتك الصوتية هما وسيلتا التحقق عند الدخول. "
+            "يمكنك الآن تسجيل الدخول بصوتك في أي وقت.",
+            wait=True
+        )
+        time.sleep(1.2)
+        self.after(0, self.on_done)
+
+    def _set_status(self, text, color=None):
+        self.after(0, lambda: self.status.update(text, color))
+
+
+# ─────────────────────────────────────────────
+# شاشة تسجيل الدخول (LoginScreen) — v8
+# التغييرات: إزالة خيار "الدخول برقم الجوال"
+# ─────────────────────────────────────────────
+class LoginScreen(ctk.CTkFrame):
+    FS, DUR = 16000, 5
+
+    def __init__(self, master, on_success, on_back):
+        super().__init__(master, fg_color=C["bg"])
+        self.on_success, self.on_back = on_success, on_back
+        self.pack(fill="both", expand=True)
+        self._build()
+        self.after(600, lambda: speak(
+            "شاشة تسجيل الدخول. "
+            "اضغط على زر ابدأ التحقق الصوتي وقل كلمتك السرية للدخول."
+        ))
+
+    def _build(self):
+        header = ctk.CTkFrame(self, fg_color=C["surface"], height=56, corner_radius=0)
+        header.pack(fill="x")
+        ctk.CTkButton(header, text="→", width=44, height=36,
+                      fg_color="transparent", text_color=C["gold"],
+                      font=("Helvetica", 20),
+                      command=lambda: [speak("العودة للقائمة الرئيسية."), self.on_back()]
+                      ).pack(side="left", padx=10)
+        ctk.CTkLabel(header, text="تسجيل الدخول",
+                     font=("Helvetica", 17, "bold"),
+                     text_color=C["gold"]).pack(side="right", padx=20)
+
+        SeparatorLine(self).pack(fill="x")
+
+        ctk.CTkFrame(self, height=18, fg_color="transparent").pack()
+        GoldenRingsCanvas(self, size=130).pack()
+        ctk.CTkFrame(self, height=8, fg_color="transparent").pack()
+
+        ctk.CTkLabel(self, text="مرحباً بعودتك",
+                     font=("Georgia", 22, "bold"),
+                     text_color=C["white"]).pack()
+        ctk.CTkLabel(self, text="انطق كلمتك السرية للدخول",
+                     font=("Helvetica", 14),
+                     text_color=C["white_70"]).pack(pady=(4, 18))
+
+        # بطاقة شرح التحقق المزدوج
+        info_card = ctk.CTkFrame(self, fg_color=C["card"], corner_radius=14,
+                                  border_color=C["card_border"], border_width=1)
+        info_card.pack(fill="x", padx=30, pady=(0, 12))
+        ctk.CTkLabel(info_card,
+                     text="🔐  التحقق المزدوج: كلمة المرور + بصمة الصوت",
+                     font=("Helvetica", 12),
+                     text_color=C["white_40"]).pack(padx=16, pady=10)
+
+        self.wave = VoiceWaveCanvas(self, height=70)
+        self.wave.pack(fill="x", padx=30, pady=8)
+
+        self.status = StatusBadge(self, text="اضغط الزر وانطق كلمتك السرية")
+        self.status.pack(padx=30, fill="x", pady=12)
+
+        self.btn = GoldButton(self, text="🔊  ابدأ التحقق الصوتي",
+                              command=self._start_voice)
+        self.btn.pack(fill="x", padx=30, pady=(8, 14))
+
+    # ── دخول بالصوت ─────────────────────────────────────
+    def _start_voice(self):
+        self.btn.configure(state="disabled")
+        speak("قل كلمتك السرية الآن.")
+        threading.Thread(target=self._logic_voice, daemon=True).start()
+
+    def _logic_voice(self):
+        self.status.update("🎤 تحدث الآن...", C["warning"])
+        self.wave.start()
+        rec = sd.rec(int(self.DUR * self.FS), samplerate=self.FS, channels=1)
+        sd.wait()
+        self.wave.stop()
+
+        word   = transcribe_audio(rec, self.FS)
+        fp_now = extract_fingerprint(rec, self.FS)
+        uid, w = self._match_user(word, fp_now, SecurityLayer.LOGIN_THRESHOLD)
+        self._handle_result(uid, w)
+
+    def _match_user(self, word, fp_now, threshold):
+        """التحقق المزدوج: كلمة المرور + البصمة الصوتية"""
+        for uid in SecurityLayer.list_users():
+            h = SecurityLayer.get_word_hash(uid)
+            if SecurityLayer.verify_spoken_word(word, h):
+                stored = SecurityLayer.load_fingerprint(uid, word)
+                if stored is not None and voice_similarity(fp_now, stored) > threshold:
+                    return uid, word
+        return None, None
+
+    def _handle_result(self, uid, word):
+        if uid:
+            speak("مرحباً. تم التحقق من هويتك بنجاح. جارٍ فتح حسابك.")
+            self.status.update("✅ تم التحقق بنجاح!", C["success"])
+            self.after(1200, lambda: self.on_success(uid, word))
+        else:
+            speak("عذراً، لم يتطابق الصوت أو الكلمة. حاول مرة أخرى.")
+            self.status.update("❌ فشل التحقق. حاول مجدداً.", C["danger"])
+            self.after(0, lambda: self.btn.configure(state="normal"))
+
+
+# ─────────────────────────────────────────────
+# لوحة العمليات (DashboardScreen)
+# ─────────────────────────────────────────────
+class DashboardScreen(ctk.CTkFrame):
+    FS, DUR = 16000, 5
+
+    def __init__(self, master, user_id, session_word, on_logout):
+        super().__init__(master, fg_color=C["bg"])
+        self.user_id      = user_id
+        self.session_word = session_word
+        self.on_logout    = on_logout
+        self.beneficiaries = []
+        self.pack(fill="both", expand=True)
+        self._build()
+        self.after(600, lambda: speak(
+            "مرحباً بك في سَنَد. "
+            "رصيدك يظهر أمامك. "
+            "لإجراء دفع، اضغط زر الدفع الصوتي الذكي. "
+            "يمكنك أيضاً عرض بياناتك أو كشف الحساب."
+        ))
+
+    def _build(self):
+        # رأس الصفحة
+        header = ctk.CTkFrame(self, fg_color=C["surface"], height=60, corner_radius=0)
+        header.pack(fill="x")
+        ctk.CTkButton(header, text="خروج", width=70, height=36,
+                      fg_color=C["danger"], hover_color="#8B2020",
+                      text_color=C["white"], font=("Helvetica", 13),
+                      command=self._logout).pack(side="left", padx=15, pady=12)
+        ctk.CTkLabel(header, text="لوحة العمليات",
+                     font=("Helvetica", 18, "bold"),
+                     text_color=C["gold"]).pack(side="right", padx=20)
+
+        SeparatorLine(self).pack(fill="x")
+
+        # بطاقة الرصيد
+        card = ctk.CTkFrame(self, fg_color=C["card"], corner_radius=18,
+                            border_color=C["card_border"], border_width=1)
+        card.pack(fill="x", padx=22, pady=16)
+        ctk.CTkLabel(card, text="الرصيد المتاح",
+                     font=("Helvetica", 13),
+                     text_color=C["white_40"]).pack(pady=(14, 2))
+        ctk.CTkLabel(card, text="5٬240.00 ﷼",
+                     font=("Georgia", 34, "bold"),
+                     text_color=C["gold"]).pack()
+        ctk.CTkLabel(card, text="آخر تحديث: اليوم",
+                     font=("Helvetica", 11),
+                     text_color=C["white_40"]).pack(pady=(2, 14))
+
+        # موجة صوتية وشارة الحالة
+        self.wave = VoiceWaveCanvas(self, height=60)
+        self.wave.pack(fill="x", padx=22, pady=(0, 6))
+        self.status = StatusBadge(self, text="🟢  النظام جاهز للدفع")
+        self.status.pack(padx=22, fill="x", pady=(0, 10))
+
+        # زر الدفع الذكي
+        GoldButton(self, text="💸  دفع صوتي ذكي",
+                   command=self._payment_flow).pack(fill="x", padx=22, pady=(0, 8))
+
+        # أزرار ثانوية
+        row = ctk.CTkFrame(self, fg_color="transparent")
+        row.pack(fill="x", padx=22, pady=(0, 12))
+        OutlineButton(row, text="📋  كشف الحساب", height=46,
+                      command=lambda: speak("كشف الحساب غير متاح حالياً. سيتم إضافته قريباً.")
+                      ).pack(side="right", expand=True, fill="x", padx=(4, 0))
+        OutlineButton(row, text="👤  بياناتي", height=46,
+                      command=self._show_profile
+                      ).pack(side="right", expand=True, fill="x", padx=(0, 4))
+
+        SeparatorLine(self).pack(fill="x", padx=22)
+
+        # قائمة المستفيدين
+        ctk.CTkLabel(self, text="المستفيدون المسجّلون",
+                     font=("Helvetica", 13),
+                     text_color=C["white_40"]).pack(anchor="e", padx=26, pady=(8, 4))
+        self.scroll = ctk.CTkScrollableFrame(self, fg_color=C["surface"],
+                                              corner_radius=12, height=150)
+        self.scroll.pack(fill="x", padx=22, pady=(0, 14))
+        self._empty_lbl = ctk.CTkLabel(self.scroll,
+                                       text="لا يوجد مستفيدون بعد",
+                                       font=("Helvetica", 13),
+                                       text_color=C["white_40"])
+        self._empty_lbl.pack(pady=18)
+
+    def _show_profile(self):
+        meta = SecurityLayer.get_user_meta(self.user_id)
+        created = meta.get("created_at", "غير محدد")
+        speak(f"حسابك مُنشأ بتاريخ {created[:10] if created != 'غير محدد' else created}.")
+        self.status.update(f"📅 أُنشئ الحساب: {created[:10]}", C["info"])
+
+    # ── تدفق الدفع الذكي ────────────────────────────────
+    def _payment_flow(self):
+        def task():
+            speak("لمن تريد إرسال المبلغ؟ قل الاسم الآن.", wait=True)
+            self.status.update("🎙 اذكر اسم المستفيد", C["gold"])
+            self.wave.start()
+            rec = sd.rec(int(self.DUR * self.FS), samplerate=self.FS, channels=1)
+            sd.wait(); self.wave.stop()
+            target = transcribe_audio(rec, self.FS)
+
+            if not target:
+                speak("لم أسمع الاسم. تم إلغاء العملية. حاول مجدداً.")
+                self.status.update("❌ تم الإلغاء", C["danger"])
+                return
+
+            if target in self.beneficiaries:
+                self._proceed_payment(target)
+            else:
+                speak(f"لم أجد {target} في قائمتك. هل تريد إضافته؟ قل نعم أو لا.", wait=True)
+                self.status.update(f"❓ إضافة {target}؟", C["info"])
+                self.wave.start()
+                rec2 = sd.rec(int(4 * self.FS), samplerate=self.FS, channels=1)
+                sd.wait(); self.wave.stop()
+                ans = transcribe_audio(rec2, self.FS)
+                if any(w in ans for w in ["نعم", "yes", "أضف", "اوكي", "تمام", "موافق"]):
+                    self._add_beneficiary(target)
+                    self._proceed_payment(target)
+                else:
+                    speak("تم إلغاء عملية الدفع.")
+                    self.status.update("تم الإلغاء", C["white_40"])
+
+        threading.Thread(target=task, daemon=True).start()
+
+    def _proceed_payment(self, name: str):
+        speak(f"كم المبلغ الذي تريد إرساله لـ {name}؟ قله الآن.", wait=True)
+        self.status.update(f"💰 حدد المبلغ لـ {name}", C["gold"])
+        self.wave.start()
+        rec_amt = sd.rec(int(self.DUR * self.FS), samplerate=self.FS, channels=1)
+        sd.wait(); self.wave.stop()
+        amount = transcribe_audio(rec_amt, self.FS) or "المبلغ المذكور"
+
+        speak(f"لتأكيد تحويل {amount} لـ {name}، قل كلمتك السرية الآن.", wait=True)
+        self.status.update("🔐 أكّد بصمة صوتك", C["danger"])
+        self.wave.start()
+        rec_auth = sd.rec(int(self.DUR * self.FS), samplerate=self.FS, channels=1)
+        sd.wait(); self.wave.stop()
+
+        word_now    = transcribe_audio(rec_auth, self.FS)
+        fp_now      = extract_fingerprint(rec_auth, self.FS)
+        stored_hash = SecurityLayer.get_word_hash(self.user_id)
+        word_ok     = SecurityLayer.verify_spoken_word(word_now, stored_hash)
+        stored_fp   = SecurityLayer.load_fingerprint(self.user_id, word_now)
+        sim         = voice_similarity(fp_now, stored_fp) if stored_fp is not None else 0.0
+
+        if word_ok and sim > SecurityLayer.PAYMENT_THRESHOLD:
+            speak(f"تم التحقق. جارٍ تحويل {amount} إلى {name}. بالتوفيق.")
+            self.status.update(f"✅ تم التحويل لـ {name}", C["success"])
+        else:
+            speak("عذراً. كلمة السر أو بصمة الصوت غير مطابقة. تم إلغاء العملية.")
+            self.status.update("❌ فشل التحقق الأمني", C["danger"])
+
+    def _add_beneficiary(self, name: str):
+        self.beneficiaries.append(name)
+        self.after(0, lambda: self._render_beneficiary(name))
+
+    def _render_beneficiary(self, name: str):
+        if hasattr(self, '_empty_lbl') and self._empty_lbl.winfo_exists():
+            self._empty_lbl.destroy()
+        row = ctk.CTkFrame(self.scroll, fg_color=C["card"],
+                           corner_radius=10, border_color=C["card_border"],
+                           border_width=1)
+        row.pack(fill="x", pady=3, padx=4)
+        ctk.CTkLabel(row, text="👤", font=("Helvetica", 18)).pack(side="right", padx=12, pady=8)
+        ctk.CTkLabel(row, text=name, font=("Helvetica", 15),
+                     text_color=C["white"]).pack(side="right", pady=8)
+
+    def _logout(self):
+        speak("إلى اللقاء. تصبح على خير.")
+        time.sleep(0.6)
+        self.on_logout()
+
+
+# ─────────────────────────────────────────────
+# التطبيق الرئيسي والتنقل بين الشاشات
+# ─────────────────────────────────────────────
+class SanadApp(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+        self.title("سَنَد v8.0 — نظام الدفع الذكي الصوتي")
+        self.geometry("410x730")
+        self.resizable(False, False)
+        self.configure(fg_color=C["bg"])
+
+        self.update_idletasks()
+        sw = self.winfo_screenwidth()
+        sh = self.winfo_screenheight()
+        x  = (sw - 410) // 2
+        y  = (sh - 730) // 2
+        self.geometry(f"410x730+{x}+{y}")
+
+        self.bind("<Key-1>", lambda e: self._show_register())
+        self.bind("<Key-2>", lambda e: self._show_login())
+
+        self._show_home()
+
+    def _clear(self):
+        for w in self.winfo_children():
+            w.destroy()
+
+    def _show_home(self):
+        self._clear()
+        HomeScreen(self, on_login=self._show_login, on_register=self._show_register)
+
+    def _show_register(self):
+        self._clear()
+        RegisterScreen(self, on_done=self._show_home, on_back=self._show_home)
+
+    def _show_login(self):
+        self._clear()
+        LoginScreen(self, on_success=self._on_login_success, on_back=self._show_home)
+
+    def _on_login_success(self, uid, word):
+        self._clear()
+        DashboardScreen(self, uid, word, on_logout=self._show_home)
+
+
+if __name__ == "__main__":
+    app = SanadApp()
+    app.mainloop()
